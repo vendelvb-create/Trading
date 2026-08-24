@@ -270,28 +270,6 @@ void OnTick()
    if(currentBarTime <= lastBarTime)
       return;
 
-   if(!PersistProcessedBar(currentBarTime))
-   {
-      Print("GoldBotV3: Trading blocked - current bar could not be persisted.");
-      return;
-   }
-
-   lastBarTime = currentBarTime;
-
-   //--- Daily loss protection
-   if(IsDailyLossLimitReached())
-   {
-      Print("GoldBotV3: Daily loss limit reached.");
-      return;
-   }
-
-   //--- Maximum positions
-   if(CountMyPositions() >= InpMaxPositions)
-   {
-      Print("GoldBotV3: Maximum positions reached.");
-      return;
-   }
-
    //================================================================
    // INDICATOR ARRAYS
    //================================================================
@@ -341,6 +319,28 @@ void OnTick()
 
    if(close1 <= 0)
       return;
+
+   if(!PersistProcessedBar(currentBarTime))
+   {
+      Print("GoldBotV3: Trading blocked - current bar could not be persisted.");
+      return;
+   }
+
+   lastBarTime = currentBarTime;
+
+   //--- Daily loss protection
+   if(IsDailyLossLimitReached())
+   {
+      Print("GoldBotV3: Daily loss limit reached.");
+      return;
+   }
+
+   //--- Maximum positions
+   if(CountMyPositions() >= InpMaxPositions)
+   {
+      Print("GoldBotV3: Maximum positions reached.");
+      return;
+   }
 
    //================================================================
    // EMA CROSS SIGNAL
