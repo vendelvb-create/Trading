@@ -79,8 +79,15 @@ int atrHandle      = INVALID_HANDLE;
 datetime lastBarTime   = 0;
 datetime lastTradeTime = 0;
 
-double dayStartEquity = 0.0;
-int    currentDay     = -1;
+double dayStartEquity  = 0.0;
+int    currentDay      = -1;
+bool   barStateReady   = false;
+
+string stateScopeKey   = "";
+string barStateKey     = "";
+string instanceLockKey = "";
+double instanceToken   = 0.0;
+bool   instanceLockHeld = false;
 
 //==================================================================
 // INITIALIZATION
@@ -88,6 +95,28 @@ int    currentDay     = -1;
 
 int OnInit()
 {
+   ENUM_ACCOUNT_MARGIN_MODE marginMode =
+      (ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(
+         ACCOUNT_MARGIN_MODE
+      );
+
+   if(marginMode != ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
+   {
+      Print(
+         "GoldBotV3: INIT FAILED - account mode ",
+         EnumToString(marginMode),
+         " uses netted symbol positions; GoldBot ownership cannot be safely attributed."
+      );
+
+      return INIT_FAILED;
+   }
+
+   if(!InitializeStateKeys() ||
+      !AcquireInstanceLock())
+   {
+      return INIT_FAILED;
+   }
+
    trade.SetExpertMagicNumber(InpMagicNumber);
    trade.SetDeviationInPoints(50);
 
@@ -142,15 +171,34 @@ int OnInit()
       atrHandle == INVALID_HANDLE)
    {
       Print("GoldBotV3: Failed to create indicator handles.");
+      ReleaseInstanceLock();
       return INIT_FAILED;
    }
 
-   //--- Daily equity baseline
-   dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   int tradingDay = -1;
 
-   MqlDateTime dt;
-   TimeToStruct(TimeCurrent(), dt);
-   currentDay = dt.day;
+   if(!GetTradingDayIdentity(TimeCurrent(), tradingDay) ||
+      !LoadOrCreateDailyBaseline(tradingDay) ||
+      !RestoreLastTradeTime())
+   {
+      Print("GoldBotV3: INIT FAILED - restart-safe state could not be established.");
+      ReleaseInstanceLock();
+      return INIT_FAILED;
+   }
+
+   datetime currentBarTime = iTime(
+      InpSymbol,
+      InpTimeframe,
+      0
+   );
+
+   if(currentBarTime > 0 &&
+      !InitializeBarState(currentBarTime))
+   {
+      Print("GoldBotV3: INIT FAILED - processed-bar state could not be established.");
+      ReleaseInstanceLock();
+      return INIT_FAILED;
+   }
 
    Print("==============================================");
    Print("GoldBotV3 initialized.");
@@ -186,6 +234,8 @@ void OnDeinit(const int reason)
 
    if(atrHandle != INVALID_HANDLE)
       IndicatorRelease(atrHandle);
+
+   ReleaseInstanceLock();
 }
 
 //==================================================================
@@ -194,7 +244,11 @@ void OnDeinit(const int reason)
 
 void OnTick()
 {
-   ResetDailyStatsIfNeeded();
+   if(!ResetDailyStatsIfNeeded())
+   {
+      Print("GoldBotV3: Trading blocked - daily state is unavailable.");
+      return;
+   }
 
    //--- Only make decisions on a new M30 candle
    datetime currentBarTime = iTime(
@@ -206,8 +260,21 @@ void OnTick()
    if(currentBarTime == 0)
       return;
 
-   if(currentBarTime == lastBarTime)
+   if(!barStateReady &&
+      !InitializeBarState(currentBarTime))
+   {
+      Print("GoldBotV3: Trading blocked - processed-bar state is unavailable.");
       return;
+   }
+
+   if(currentBarTime <= lastBarTime)
+      return;
+
+   if(!PersistProcessedBar(currentBarTime))
+   {
+      Print("GoldBotV3: Trading blocked - current bar could not be persisted.");
+      return;
+   }
 
    lastBarTime = currentBarTime;
 
@@ -329,6 +396,44 @@ void OnTick()
       {
          Print("GoldBotV3: SELL rejected by filters.");
       }
+   }
+}
+
+//==================================================================
+// TRADE TRANSACTION CONFIRMATION
+//==================================================================
+
+void OnTradeTransaction(
+   const MqlTradeTransaction &trans,
+   const MqlTradeRequest &request,
+   const MqlTradeResult &result)
+{
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD ||
+      trans.deal == 0)
+   {
+      return;
+   }
+
+   datetime dealTime = 0;
+
+   if(!GetOwnedEntryDeal(
+      trans.deal,
+      true,
+      dealTime))
+   {
+      return;
+   }
+
+   if(dealTime > lastTradeTime)
+   {
+      lastTradeTime = dealTime;
+
+      Print(
+         "GoldBotV3: CONFIRMED DEAL transaction. Deal=",
+         trans.deal,
+         " Time=",
+         TimeToString(dealTime, TIME_DATE | TIME_SECONDS)
+      );
    }
 }
 
@@ -590,30 +695,18 @@ void OpenBuy(double atr)
       DoubleToString(tp, _Digits)
    );
 
-   if(trade.Buy(
+   ResetLastError();
+
+   bool requestAccepted = trade.Buy(
       InpLots,
       InpSymbol,
       0.0,
       sl,
       tp,
-      "GoldBotV3 BUY"))
-   {
-      lastTradeTime = TimeCurrent();
+      "GoldBotV3 BUY"
+   );
 
-      Print(
-         "GoldBotV3: BUY opened. Ticket=",
-         trade.ResultOrder()
-      );
-   }
-   else
-   {
-      Print(
-         "GoldBotV3: BUY failed. Error=",
-         trade.ResultRetcode(),
-         " ",
-         trade.ResultRetcodeDescription()
-      );
-   }
+   VerifyTradeResult("BUY", requestAccepted);
 }
 
 //==================================================================
@@ -664,30 +757,18 @@ void OpenSell(double atr)
       DoubleToString(tp, _Digits)
    );
 
-   if(trade.Sell(
+   ResetLastError();
+
+   bool requestAccepted = trade.Sell(
       InpLots,
       InpSymbol,
       0.0,
       sl,
       tp,
-      "GoldBotV3 SELL"))
-   {
-      lastTradeTime = TimeCurrent();
+      "GoldBotV3 SELL"
+   );
 
-      Print(
-         "GoldBotV3: SELL opened. Ticket=",
-         trade.ResultOrder()
-      );
-   }
-   else
-   {
-      Print(
-         "GoldBotV3: SELL failed. Error=",
-         trade.ResultRetcode(),
-         " ",
-         trade.ResultRetcodeDescription()
-      );
-   }
+   VerifyTradeResult("SELL", requestAccepted);
 }
 
 //==================================================================
@@ -727,6 +808,441 @@ int CountMyPositions()
 }
 
 //==================================================================
+// TRADE RESULT / DEAL VERIFICATION
+//==================================================================
+
+bool VerifyTradeResult(
+   string side,
+   bool requestAccepted)
+{
+   uint retcode = trade.ResultRetcode();
+   ulong dealTicket = trade.ResultDeal();
+   ulong orderTicket = trade.ResultOrder();
+
+   if(!requestAccepted)
+   {
+      Print(
+         "GoldBotV3: ",
+         side,
+         " LOCAL REQUEST FAILURE. Retcode=",
+         retcode,
+         " Description=",
+         trade.ResultRetcodeDescription(),
+         " LastError=",
+         GetLastError()
+      );
+
+      return false;
+   }
+
+   if(retcode == TRADE_RETCODE_DONE ||
+      retcode == TRADE_RETCODE_DONE_PARTIAL)
+   {
+      datetime dealTime = 0;
+
+      if(dealTicket == 0 ||
+         !GetOwnedEntryDeal(
+            dealTicket,
+            true,
+            dealTime))
+      {
+         Print(
+            "GoldBotV3: ",
+            side,
+            " AMBIGUOUS SERVER RESULT. Retcode=",
+            retcode,
+            " Description=",
+            trade.ResultRetcodeDescription(),
+            " Order=",
+            orderTicket,
+            " Deal=",
+            dealTicket,
+            ". Execution could not be verified; cooldown not started."
+         );
+
+         return false;
+      }
+
+      if(dealTime > lastTradeTime)
+         lastTradeTime = dealTime;
+
+      Print(
+         "GoldBotV3: ",
+         side,
+         retcode == TRADE_RETCODE_DONE_PARTIAL
+            ? " CONFIRMED PARTIAL EXECUTION."
+            : " CONFIRMED EXECUTION.",
+         " Retcode=",
+         retcode,
+         " Order=",
+         orderTicket,
+         " Deal=",
+         dealTicket
+      );
+
+      return true;
+   }
+
+   if(retcode == TRADE_RETCODE_PLACED)
+   {
+      Print(
+         "GoldBotV3: ",
+         side,
+         " AMBIGUOUS SERVER RESULT. Order accepted/placed but no execution is confirmed. Retcode=",
+         retcode,
+         " Order=",
+         orderTicket,
+         ". Cooldown awaits an owned entry deal transaction."
+      );
+
+      return false;
+   }
+
+   Print(
+      "GoldBotV3: ",
+      side,
+      " SERVER EXECUTION FAILURE. Retcode=",
+      retcode,
+      " Description=",
+      trade.ResultRetcodeDescription(),
+      " Order=",
+      orderTicket,
+      " Deal=",
+      dealTicket
+   );
+
+   return false;
+}
+
+bool GetOwnedEntryDeal(
+   ulong dealTicket,
+   bool selectDeal,
+   datetime &dealTime)
+{
+   dealTime = 0;
+
+   if(dealTicket == 0)
+      return false;
+
+   if(selectDeal &&
+      !HistoryDealSelect(dealTicket))
+   {
+      return false;
+   }
+
+   string symbol =
+      HistoryDealGetString(
+         dealTicket,
+         DEAL_SYMBOL
+      );
+
+   long magic =
+      HistoryDealGetInteger(
+         dealTicket,
+         DEAL_MAGIC
+      );
+
+   ENUM_DEAL_TYPE dealType =
+      (ENUM_DEAL_TYPE)HistoryDealGetInteger(
+         dealTicket,
+         DEAL_TYPE
+      );
+
+   ENUM_DEAL_ENTRY dealEntry =
+      (ENUM_DEAL_ENTRY)HistoryDealGetInteger(
+         dealTicket,
+         DEAL_ENTRY
+      );
+
+   if(symbol != InpSymbol ||
+      magic != (long)InpMagicNumber ||
+      (dealType != DEAL_TYPE_BUY &&
+       dealType != DEAL_TYPE_SELL) ||
+      (dealEntry != DEAL_ENTRY_IN &&
+       dealEntry != DEAL_ENTRY_INOUT))
+   {
+      return false;
+   }
+
+   dealTime =
+      (datetime)HistoryDealGetInteger(
+         dealTicket,
+         DEAL_TIME
+      );
+
+   return dealTime > 0;
+}
+
+bool RestoreLastTradeTime()
+{
+   datetime serverTime = TimeCurrent();
+
+   if(serverTime <= 0)
+   {
+      Print("GoldBotV3: Cannot restore cooldown - invalid server time.");
+      return false;
+   }
+
+   ResetLastError();
+
+   if(!HistorySelect(0, serverTime))
+   {
+      Print(
+         "GoldBotV3: Cannot restore cooldown from deal history. Error=",
+         GetLastError()
+      );
+
+      return false;
+   }
+
+   int totalDeals = HistoryDealsTotal();
+
+   for(int i = totalDeals - 1;
+       i >= 0;
+       i--)
+   {
+      ulong dealTicket = HistoryDealGetTicket(i);
+      datetime dealTime = 0;
+
+      if(GetOwnedEntryDeal(
+         dealTicket,
+         false,
+         dealTime))
+      {
+         lastTradeTime = dealTime;
+
+         Print(
+            "GoldBotV3: Restored last confirmed trade. Deal=",
+            dealTicket,
+            " Time=",
+            TimeToString(dealTime, TIME_DATE | TIME_SECONDS)
+         );
+
+         return true;
+      }
+   }
+
+   lastTradeTime = 0;
+   Print("GoldBotV3: No prior owned entry deal found for cooldown recovery.");
+   return true;
+}
+
+//==================================================================
+// RESTART-SAFE STATE / INSTANCE OWNERSHIP
+//==================================================================
+
+ulong HashStateValue(string value)
+{
+   ulong hash = 14695981039346656037;
+
+   for(int i = 0;
+       i < StringLen(value);
+       i++)
+   {
+      hash ^= (ulong)StringGetCharacter(value, i);
+      hash *= 1099511628211;
+   }
+
+   return hash;
+}
+
+bool InitializeStateKeys()
+{
+   long accountLogin =
+      AccountInfoInteger(ACCOUNT_LOGIN);
+
+   string accountServer =
+      AccountInfoString(ACCOUNT_SERVER);
+
+   if(accountLogin <= 0 ||
+      accountServer == "" ||
+      InpSymbol == "")
+   {
+      Print("GoldBotV3: Cannot create restart-safe state scope.");
+      return false;
+   }
+
+   string scope = StringFormat(
+      "%s|%I64d|%s|%I64u",
+      accountServer,
+      accountLogin,
+      InpSymbol,
+      InpMagicNumber
+   );
+
+   stateScopeKey = StringFormat(
+      "%I64u",
+      HashStateValue(scope)
+   );
+
+   barStateKey = StringFormat(
+      "GB3B.%s.%d",
+      stateScopeKey,
+      (int)InpTimeframe
+   );
+
+   instanceLockKey =
+      "GB3L." + stateScopeKey;
+
+   if(StringLen(barStateKey) > 63 ||
+      StringLen(instanceLockKey) > 63)
+   {
+      Print("GoldBotV3: Restart-safe state key exceeds terminal limit.");
+      return false;
+   }
+
+   return true;
+}
+
+bool AcquireInstanceLock()
+{
+   if(!GlobalVariableCheck(instanceLockKey))
+   {
+      ResetLastError();
+
+      if(!GlobalVariableTemp(instanceLockKey))
+      {
+         Print(
+            "GoldBotV3: Cannot create instance lock. Error=",
+            GetLastError()
+         );
+
+         return false;
+      }
+   }
+
+   string tokenSource = StringFormat(
+      "%I64d|%I64u",
+      ChartID(),
+      GetMicrosecondCount()
+   );
+
+   ulong tokenValue =
+      HashStateValue(tokenSource)
+      % 9007199254740991;
+
+   if(tokenValue == 0)
+      tokenValue = 1;
+
+   instanceToken = (double)tokenValue;
+   ResetLastError();
+
+   if(!GlobalVariableSetOnCondition(
+      instanceLockKey,
+      instanceToken,
+      0.0))
+   {
+      Print(
+         "GoldBotV3: INIT FAILED - another active instance owns account/symbol/Magic scope. Lock=",
+         instanceLockKey
+      );
+
+      return false;
+   }
+
+   instanceLockHeld = true;
+   return true;
+}
+
+void ReleaseInstanceLock()
+{
+   if(!instanceLockHeld)
+      return;
+
+   ResetLastError();
+
+   if(!GlobalVariableSetOnCondition(
+      instanceLockKey,
+      0.0,
+      instanceToken))
+   {
+      Print(
+         "GoldBotV3: Failed to release instance lock. Error=",
+         GetLastError()
+      );
+   }
+
+   instanceLockHeld = false;
+}
+
+bool PersistProcessedBar(datetime barTime)
+{
+   ResetLastError();
+
+   if(GlobalVariableSet(
+      barStateKey,
+      (double)barTime) == 0)
+   {
+      Print(
+         "GoldBotV3: Failed to persist processed bar. Error=",
+         GetLastError()
+      );
+
+      return false;
+   }
+
+   GlobalVariablesFlush();
+   return true;
+}
+
+bool InitializeBarState(datetime currentBarTime)
+{
+   if(currentBarTime <= 0)
+      return false;
+
+   if(GlobalVariableCheck(barStateKey))
+   {
+      double storedBar = 0.0;
+      ResetLastError();
+
+      if(!GlobalVariableGet(
+         barStateKey,
+         storedBar))
+      {
+         Print(
+            "GoldBotV3: Failed to restore processed bar. Error=",
+            GetLastError()
+         );
+
+         return false;
+      }
+
+      if(!MathIsValidNumber(storedBar) ||
+         storedBar <= 0.0 ||
+         storedBar != MathFloor(storedBar) ||
+         storedBar > (double)currentBarTime)
+      {
+         Print("GoldBotV3: Invalid persisted processed-bar state; trading disabled.");
+         return false;
+      }
+
+      lastBarTime = (datetime)storedBar;
+      barStateReady = true;
+
+      Print(
+         "GoldBotV3: Restored last processed bar: ",
+         TimeToString(lastBarTime, TIME_DATE | TIME_MINUTES)
+      );
+
+      return true;
+   }
+
+   if(!PersistProcessedBar(currentBarTime))
+      return false;
+
+   lastBarTime = currentBarTime;
+   barStateReady = true;
+
+   Print(
+      "GoldBotV3: Initialized processed-bar state at ",
+      TimeToString(lastBarTime, TIME_DATE | TIME_MINUTES),
+      "; current bar intentionally skipped."
+   );
+
+   return true;
+}
+
+//==================================================================
 // COOLDOWN
 //==================================================================
 
@@ -743,7 +1259,10 @@ bool CooldownOK()
    );
 
    if(barsPassed < 0)
-      return true;
+   {
+      Print("GoldBotV3: Cooldown state unavailable; trading blocked safely.");
+      return false;
+   }
 
    if(barsPassed < InpCooldownBars)
    {
@@ -762,23 +1281,138 @@ bool CooldownOK()
 // DAILY RESET
 //==================================================================
 
-void ResetDailyStatsIfNeeded()
+bool GetTradingDayIdentity(
+   datetime serverTime,
+   int &tradingDay)
 {
    MqlDateTime dt;
-   TimeToStruct(TimeCurrent(), dt);
 
-   if(currentDay != dt.day)
+   if(serverTime <= 0 ||
+      !TimeToStruct(serverTime, dt) ||
+      dt.year < 1970 ||
+      dt.mon < 1 ||
+      dt.mon > 12 ||
+      dt.day < 1 ||
+      dt.day > 31)
    {
-      currentDay = dt.day;
+      tradingDay = -1;
+      return false;
+   }
 
-      dayStartEquity =
-         AccountInfoDouble(ACCOUNT_EQUITY);
+   tradingDay =
+      dt.year * 10000 +
+      dt.mon * 100 +
+      dt.day;
+
+   return true;
+}
+
+bool LoadOrCreateDailyBaseline(int tradingDay)
+{
+   string dailyStateKey = StringFormat(
+      "GB3D.%s.%d",
+      stateScopeKey,
+      tradingDay
+   );
+
+   if(StringLen(dailyStateKey) > 63)
+   {
+      Print("GoldBotV3: Daily state key exceeds terminal limit.");
+      return false;
+   }
+
+   if(GlobalVariableCheck(dailyStateKey))
+   {
+      double storedEquity = 0.0;
+      ResetLastError();
+
+      if(!GlobalVariableGet(
+         dailyStateKey,
+         storedEquity))
+      {
+         Print(
+            "GoldBotV3: Failed to restore daily baseline. Error=",
+            GetLastError()
+         );
+
+         return false;
+      }
+
+      if(!MathIsValidNumber(storedEquity) ||
+         storedEquity <= 0.0)
+      {
+         Print("GoldBotV3: Invalid persisted daily baseline; trading disabled.");
+         return false;
+      }
+
+      dayStartEquity = storedEquity;
+      currentDay = tradingDay;
 
       Print(
-         "GoldBotV3: New trading day. Starting equity=",
+         "GoldBotV3: Restored daily baseline. TradingDay=",
+         currentDay,
+         " Equity=",
          DoubleToString(dayStartEquity, 2)
       );
+
+      return true;
    }
+
+   double currentEquity =
+      AccountInfoDouble(ACCOUNT_EQUITY);
+
+   if(!MathIsValidNumber(currentEquity) ||
+      currentEquity <= 0.0)
+   {
+      Print("GoldBotV3: Cannot establish daily baseline from current equity.");
+      return false;
+   }
+
+   ResetLastError();
+
+   if(GlobalVariableSet(
+      dailyStateKey,
+      currentEquity) == 0)
+   {
+      Print(
+         "GoldBotV3: Failed to persist daily baseline. Error=",
+         GetLastError()
+      );
+
+      return false;
+   }
+
+   GlobalVariablesFlush();
+
+   dayStartEquity = currentEquity;
+   currentDay = tradingDay;
+
+   Print(
+      "GoldBotV3: Created daily baseline. TradingDay=",
+      currentDay,
+      " Equity=",
+      DoubleToString(dayStartEquity, 2)
+   );
+
+   return true;
+}
+
+bool ResetDailyStatsIfNeeded()
+{
+   int tradingDay = -1;
+
+   if(!GetTradingDayIdentity(
+      TimeCurrent(),
+      tradingDay))
+   {
+      Print("GoldBotV3: Cannot determine complete server trading-day identity.");
+      return false;
+   }
+
+   if(currentDay == tradingDay)
+      return true;
+
+   return LoadOrCreateDailyBaseline(tradingDay);
 }
 
 //==================================================================
@@ -791,10 +1425,17 @@ bool IsDailyLossLimitReached()
       return false;
 
    if(dayStartEquity <= 0)
-      return false;
+      return true;
 
    double equity =
       AccountInfoDouble(ACCOUNT_EQUITY);
+
+   if(!MathIsValidNumber(equity) ||
+      equity <= 0.0)
+   {
+      Print("GoldBotV3: Current equity unavailable; daily-loss protection blocks trading.");
+      return true;
+   }
 
    double lossPercent =
       ((dayStartEquity - equity)
@@ -895,3 +1536,4 @@ bool ValidateStops(
 //+------------------------------------------------------------------+
 //| END OF GOLD BOT V3                                               |
 //+------------------------------------------------------------------+
+
